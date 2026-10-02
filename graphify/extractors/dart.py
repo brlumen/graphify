@@ -1,10 +1,12 @@
 """Dart extractor — tree-sitter AST walk with Flutter heuristic edges."""
 from __future__ import annotations
 
+import os
 import re
 from pathlib import Path
 
 from graphify.extractors.base import _LANGUAGE_BUILTIN_GLOBALS, _file_stem, _make_id, _read_text
+from graphify.extractors.resolution import _resolve_dart_import_target
 
 _DART_BUILTIN_TYPES = frozenset({
     "String", "int", "double", "bool", "num", "dynamic", "Object", "void",
@@ -376,8 +378,9 @@ def extract_dart(path: Path) -> dict:
     part_ref = _find_part_of(root)
     if part_ref and part_ref.endswith(".dart"):
         try:
-            parent_path = (path.parent / part_ref).resolve()
-            if parent_path.exists():
+            # #3522/#3524: mint the parent id in the caller's path space
+            parent_path = Path(os.path.normpath(path.parent / part_ref))
+            if (path.parent / part_ref).resolve().exists():
                 stem = _file_stem(parent_path)
                 file_nid = _make_id(str(parent_path))
                 is_part = True
@@ -731,36 +734,42 @@ def extract_dart(path: Path) -> dict:
                 attribute_generic_lookups_to=file_nid,
             )
 
+    def _same_space(resolved: Path) -> str:
+        """Id path for a resolved file in the caller's path space (abs vs relative)."""
+        if path.is_absolute():
+            return str(resolved)
+        return os.path.relpath(resolved)
+
     def handle_import_export(node) -> None:
         is_export = any(c.type == "library_export" for c in node.children)
-        uri = None
+        relation = "exports" if is_export else "imports"
+        uri_nodes: list = []
 
-        def find_uri(n) -> str | None:
-            if n.type == "uri" or n.type == "configurable_uri":
-                text = _strip_quotes(_read_text(n, source))
-                # configurable_uri wraps uri
-                if n.type == "configurable_uri":
-                    for c in n.children:
-                        if c.type == "uri":
-                            return _strip_quotes(_read_text(c, source))
-                return text
+        # The default uri first, then every `if (dart.library.x) '...'` branch
+        # (a string inside the condition is a string_literal, not a uri).
+        def collect(n) -> None:
+            if n.type == "uri":
+                uri_nodes.append(n)
+                return
             for c in n.children:
-                found = find_uri(c)
-                if found:
-                    return found
-            return None
+                collect(c)
 
-        uri = find_uri(node)
-        if not uri:
-            return
-        line = _line_of(node)
-        tgt = ensure_external(uri)
-        # ensure label is full uri
-        for n in nodes:
-            if n["id"] == tgt:
-                n["label"] = uri
-                break
-        add_edge(file_nid, tgt, "exports" if is_export else "imports", line=line)
+        collect(node)
+        for i, uri_node in enumerate(uri_nodes):
+            uri = _strip_quotes(_read_text(uri_node, source))
+            line = _line_of(uri_node)
+            context = "conditional_uri" if i else None
+            resolved = _resolve_dart_import_target(uri, str(path))
+            if resolved is not None:
+                add_edge(file_nid, _make_id(_same_space(resolved)), relation,
+                         line=line, context=context)
+                continue
+            tgt = ensure_external(uri)
+            for n in nodes:
+                if n["id"] == tgt:
+                    n["label"] = uri
+                    break
+            add_edge(file_nid, tgt, relation, line=line, context=context)
 
     def handle_top_level_vars(program) -> None:
         """Scan program children for top-level variable declarations."""
@@ -1054,4 +1063,10 @@ def extract_dart(path: Path) -> dict:
     for caller_nid, body_node, _top in function_bodies:
         walk_calls(body_node, caller_nid)
 
+    if is_part:
+        # Part symbols carry the library's id prefix; tell the canonical-id
+        # remap which file that prefix belongs to (#3522).
+        for n in nodes:
+            if n.get("source_file"):
+                n["_id_scope_file"] = str(parent_path)
     return {"nodes": nodes, "edges": edges, "raw_calls": raw_calls}

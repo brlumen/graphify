@@ -7893,7 +7893,9 @@ def extract(
             if n.get("type") == "package":
                 continue
             try:
-                entry = prefix_remap.get(Path(sf).resolve())
+                # A Dart part file's symbols carry its library's id prefix
+                # (#3522): look the prefix up by the library, not the part.
+                entry = prefix_remap.get(Path(n.get("_id_scope_file") or sf).resolve())
             except Exception:
                 continue
             if entry is None:
@@ -7983,6 +7985,10 @@ def extract(
                         continue
                 deduped_edges.append(edge)
             all_edges[:] = deduped_edges
+
+    # The id-scope hint is only for the remap above; keep it out of graph.json.
+    for n in all_nodes:
+        n.pop("_id_scope_file", None)
 
     # Repoint symbol-level alias edges that resolve THROUGH a barrel (#1983
     # follow-up). The candidates rewrite above learns old→canonical forms only
