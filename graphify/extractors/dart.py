@@ -364,18 +364,19 @@ def extract_dart(path: Path) -> dict:
     is_part = False
     file_nid = _make_id(str(path))
 
-    def _find_part_of(node) -> str | None:
+    def _find_part_of(node):
         if node.type == "part_of_directive":
             for c in node.children:
                 if c.type == "uri":
-                    return _strip_quotes(_read_text(c, source))
+                    return c
         for c in node.children:
             found = _find_part_of(c)
-            if found:
+            if found is not None:
                 return found
         return None
 
-    part_ref = _find_part_of(root)
+    part_uri_node = _find_part_of(root)
+    part_ref = _strip_quotes(_read_text(part_uri_node, source)) if part_uri_node is not None else None
     if part_ref and part_ref.endswith(".dart"):
         try:
             # #3522/#3524: mint the parent id in the caller's path space
@@ -387,8 +388,11 @@ def extract_dart(path: Path) -> dict:
         except Exception:
             pass
 
-    if not is_part:
-        add_node(file_nid, path.name, source_file=str_path, line=None)
+    # Every scanned file keeps its own file node. For a part file the symbols
+    # still belong to the library (file_nid above); the part's node is linked
+    # from the library and to its symbols at the end of extraction.
+    own_nid = _make_id(str(path))
+    add_node(own_nid, path.name, source_file=str_path, line=None)
 
     def emit_annotation_edges(ann_node, target_nid: str, target_name: str, target_kind: str) -> None:
         name = None
@@ -1067,6 +1071,14 @@ def extract_dart(path: Path) -> dict:
         # Part symbols carry the library's id prefix; tell the canonical-id
         # remap which file that prefix belongs to (#3522).
         for n in nodes:
-            if n.get("source_file"):
+            if n.get("source_file") and n["id"] != own_nid:
                 n["_id_scope_file"] = str(parent_path)
+        # The library includes this part; the part physically contains the
+        # declarations the library defines from it (#4008).
+        part_edges = [{**e, "source": own_nid, "relation": "contains"}
+                      for e in edges
+                      if e["source"] == file_nid and e["relation"] == "defines"]
+        add_edge(file_nid, own_nid, "includes",
+                 line=_line_of(part_uri_node) if part_uri_node is not None else None)
+        edges.extend(part_edges)
     return {"nodes": nodes, "edges": edges, "raw_calls": raw_calls}
